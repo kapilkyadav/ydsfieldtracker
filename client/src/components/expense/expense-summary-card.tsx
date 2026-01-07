@@ -54,7 +54,7 @@ export function ExpenseSummaryCard({ claim, isLoading }: ExpenseSummaryCardProps
   }
 
   const status = claim.status as ExpenseClaimStatus;
-  const config = statusConfig[status];
+  const config = statusConfig[status] || statusConfig.DRAFT;
   const StatusIcon = config.icon;
 
   const kmClaimed = parseFloat(claim.kmClaimed?.toString() || "0");
