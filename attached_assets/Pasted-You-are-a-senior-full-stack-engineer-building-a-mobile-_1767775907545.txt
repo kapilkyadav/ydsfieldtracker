@@ -1,0 +1,184 @@
+You are a senior full-stack engineer building a mobile-first PWA for YDS India to track field team activity for Sales Meetings and Project Site Visits.
+
+GOAL (MVP):
+- Users start a Duty Session (Start Day) from anywhere including home.
+- Users or Managers create/assign Visits (Sales Meeting or Site Visit) with required details.
+- Users must complete each Visit with geofence check-in + photo + notes + check-out.
+- GPS pings are collected during the Duty Session (while app is open).
+- Daily expense is computed ONLY from first completed business check-in to last completed business check-out within the session window.
+- If GPS data is missing/sparse or accuracy is too poor, expense claim becomes NEEDS_APPROVAL.
+- Managers can approve/adjust/reject claims. Every manager action is audited.
+
+TECH STACK:
+- Frontend: React + Vite + TypeScript + Tailwind (mobile-first). Installable PWA.
+- Backend: Node.js + Express + TypeScript.
+- DB: Postgres (use Neon or Supabase Postgres). Use a .env DATABASE_URL.
+- ORM: Prisma.
+- Storage: Use Supabase Storage or S3-compatible bucket; store photo URLs in DB. For MVP you can store local files in /uploads if needed but keep interface so it can switch to real storage.
+
+SECURITY:
+- Auth for MVP: email+password (simple). (Later we can swap to OTP.)
+- RBAC roles: ADMIN, MANAGER, SALES, PROJECTS.
+- All APIs require auth except /auth endpoints.
+- Only MANAGER/ADMIN can assign visits and approve expenses.
+- SALES/PROJECTS can only see their own sessions/visits/claims.
+
+PWA REQUIREMENTS:
+- Add manifest.json with name/icons.
+- Add service worker using vite-plugin-pwa.
+- Must work on Android Chrome and iOS Safari “Add to Home Screen”.
+- GPS: use navigator.geolocation. Request high accuracy.
+- Capture GPS:
+  - On Start Day: capture start point
+  - Every 60 seconds while “On Duty” AND app tab is active (document.visibilityState === 'visible')
+  - On every Check-in and Check-out event
+  - On End Day: capture end point
+- Store each point with timestamp and accuracy_m.
+- RULE: Do not attempt true background tracking. Show a banner: “Keep app open during travel for accurate expense.”
+
+BUSINESS RULES (NON-NEGOTIABLE):
+1) Start Day opens duty_sessions row (status OPEN).
+2) Visit creation:
+   - Created by user OR assigned by manager.
+   - Required fields: visit_type (SALES_MEETING or SITE_VISIT), title, location_lat, location_lng, location_address_text, planned_start_at (optional), client/project code reference.
+3) Visit completion proof:
+   - CHECK_IN allowed only if user within geofence_radius_m (default 150m) of target.
+   - If GPS accuracy > 80m at check-in, block and ask user to retry.
+   - Must upload at least 1 photo and 1 note across check-in/out (enforce at check-out minimum).
+   - CHECK_OUT required to mark visit COMPLETED.
+4) Expense window:
+   - Determine first_business_checkin_time = earliest CHECK_IN among COMPLETED visits in the session.
+   - Determine last_business_checkout_time = latest CHECK_OUT among COMPLETED visits in the session.
+   - Only points between these timestamps count for reimbursable km.
+   - Reimbursable km = sum of haversine distance between consecutive GPS points ordered by time, ignoring jumps where accuracy_m > 80 or time gap > 10 minutes (mark as “sparse”).
+   - If fewer than 10 valid points OR sparse gaps exist, claim status becomes NEEDS_APPROVAL and exception_reason explains why.
+   - Amount = km * rate_per_km from active policy.
+5) Commute exclusion:
+   - Any travel before first business check-in or after last business check-out is not reimbursable by default.
+6) Manager approvals:
+   - Manager can APPROVE, REJECT, ADJUST (set km_approved and amount_approved) with a note.
+   - Every action writes to expense_approvals and audit_logs.
+
+DATABASE (PRISMA MODELS + SQL MIGRATION):
+Implement these tables (fields and constraints):
+
+- users(id uuid, full_name, email unique, password_hash, role, is_active, created_at)
+- devices(id uuid, user_id fk, device_fingerprint unique, platform, last_seen_at, created_at)
+- clients(id uuid, name, phone, email, city, created_at)
+- projects(id uuid, project_code unique, client_id fk, site_address_text, site_lat, site_lng, status, created_at)
+
+- duty_sessions(id uuid, user_id fk, device_id fk null, start_at, end_at null, start_lat, start_lng, end_lat, end_lng, start_address_text, end_address_text, status OPEN/CLOSED, created_at)
+
+- location_points(id bigserial, session_id fk, captured_at, lat, lng, accuracy_m, speed_mps null, battery_pct null, source, is_mock false)
+
+- visits(id uuid, visit_type, created_by_user_id fk, assigned_to_user_id fk, assigned_by_user_id fk null, client_id fk null, project_id fk null,
+  title, purpose null, planned_start_at null, planned_end_at null,
+  location_address_text, location_lat, location_lng, geofence_radius_m default 150,
+  status PLANNED/IN_PROGRESS/COMPLETED/CANCELLED/NO_SHOW default PLANNED,
+  created_at)
+
+- visit_events(id uuid, visit_id fk, event_type CHECK_IN/CHECK_OUT/PHOTO/NOTE/STATUS_CHANGE, event_at default now(),
+  lat null, lng null, accuracy_m null, distance_to_target_m null, photo_url null, note null, created_by_user_id fk)
+
+- expense_policies(id uuid, name, rate_per_km numeric, min_accuracy_m default 50, ping_interval_sec default 60, geofence_default_m default 150,
+  calc_mode TRACK_SUM, effective_from date, is_active true)
+
+- expense_claims(id uuid, user_id fk, session_id fk, policy_id fk,
+  first_business_visit_id fk null, last_business_visit_id fk null,
+  business_start_at null, business_end_at null,
+  km_claimed numeric default 0, km_approved numeric default 0,
+  amount_claimed numeric default 0, amount_approved numeric default 0,
+  status DRAFT/SUBMITTED/NEEDS_APPROVAL/APPROVED/REJECTED default DRAFT,
+  exception_reason null,
+  created_at)
+
+- expense_approvals(id uuid, claim_id fk, action APPROVE/REJECT/REQUEST_INFO/ADJUST, approved_by_user_id fk, note null, created_at)
+
+- audit_logs(id bigserial, actor_user_id fk, entity_type, entity_id, action, before_json jsonb null, after_json jsonb null, created_at)
+
+Add indexes:
+- visits(assigned_to_user_id, planned_start_at)
+- duty_sessions(user_id, start_at)
+- location_points(session_id, captured_at)
+- visit_events(visit_id, event_at)
+- expense_claims(session_id), expense_claims(status)
+
+SEED DATA:
+- Create 1 admin user: admin@yds.in / Password123!
+- Create 1 manager: manager@yds.in / Password123!
+- Create 1 sales user: sales1@yds.in / Password123!
+- Create 1 projects user: proj1@yds.in / Password123!
+- Create 1 active expense policy: rate_per_km = 10.00, effective_from = today, is_active = true
+- Create 2 clients and 2 projects with realistic dummy addresses and lat/lng (India).
+
+API ENDPOINTS (Express):
+Auth:
+- POST /api/auth/login  {email,password} -> token + user
+- POST /api/auth/logout
+- GET  /api/me
+
+Users (admin/manager):
+- GET /api/users
+- POST /api/users
+- PATCH /api/users/:id (activate/deactivate, role)
+
+Duty Sessions:
+- POST /api/sessions/start  -> opens OPEN session, captures first point (lat/lng/accuracy/address)
+- POST /api/sessions/:id/ping -> store location_point
+- POST /api/sessions/:id/end -> closes session, captures end point
+- GET  /api/sessions/today -> my latest session today
+
+Visits:
+- GET  /api/visits?date=YYYY-MM-DD (my visits)
+- POST /api/visits (user-created)
+- POST /api/visits/assign (manager assigns to user)
+- GET  /api/visits/:id
+- POST /api/visits/:id/checkin  {lat,lng,accuracy_m} -> validates geofence + accuracy, creates event
+- POST /api/visits/:id/checkout {lat,lng,accuracy_m,note,photo_url?} -> requires proof, marks completed
+- POST /api/visits/:id/photo (multipart or URL) -> creates PHOTO event, returns photo_url
+- POST /api/visits/:id/note {note} -> creates NOTE event
+- PATCH /api/visits/:id/status {status}
+
+Expenses:
+- POST /api/expenses/generate?session_id=... -> computes claim based on rules, upserts expense_claims
+- GET  /api/expenses/mine?date=YYYY-MM-DD
+- GET  /api/expenses/pending (manager only)
+- POST /api/expenses/:id/approve {action, km_approved?, amount_approved?, note}
+
+Dashboards (simple):
+- GET /api/dashboard/manager?date=YYYY-MM-DD -> users on duty, visits completed, exceptions, pending claims
+
+FRONTEND PAGES (mobile-first):
+1) /login
+2) /dashboard (Start Day / End Day, On Duty status, GPS banner, today summary)
+3) /visits (list for today, tabs: Today, Upcoming)
+4) /visits/:id (map link open in Google Maps, check-in button, add photo, add note, check-out)
+5) /expense (today claim km/amount/status, reason if NEEDS_APPROVAL)
+6) /manager (manager only: assign visit, pending approvals, exceptions)
+
+UI BEHAVIOR:
+- If session is OPEN show “On Duty”.
+- When On Duty and page visible, call /ping every 60 sec with current GPS.
+- On Check-in/out also call /ping immediately.
+- Show last GPS accuracy, warn if >80m.
+- Enforce proof: block checkout until at least 1 photo_url exists and a note exists (can be in checkout payload).
+
+TESTING:
+- Add minimal unit test for haversine function and expense calculation window selection.
+- Add integration test that:
+  - creates session
+  - adds 20 points
+  - creates 2 visits with check-in/out timestamps
+  - generates claim and verifies km_claimed > 0 and status not NEEDS_APPROVAL when points are sufficient.
+
+DELIVERABLES:
+- Running app in Replit with instructions in README:
+  - how to set env vars
+  - how to run migrations/seed
+  - how to start frontend and backend
+- Clean folder structure: /server and /client
+- Prisma migrations committed.
+
+IMPORTANT:
+- Keep code production-clean with validation and error messages.
+- Do not overbuild. Ship MVP matching rules exactly.
